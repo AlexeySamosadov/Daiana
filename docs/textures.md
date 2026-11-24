@@ -1062,6 +1062,18 @@ All 1,315 system streams are RAGE `pgDictionary<grcTexture>` pages containing de
 
 The normal `make_game.py` assets stage now fills missing and partial BCPack DDS entries in the same pool manifests used for model texture lookup. It uses strict decoding by default and discovers an optional local reconstruction profile at `<work>/bcpack-calibration.json`. The pass stamp in each pool manifest hashes the decoder modules (`ttpf_assets.DECODER_SOURCES`) and the profile, so a pool is done again after either changes. The single-entry exporter accepts the same profile through `--calibration`. Build instructions, the JSON schema and the game-independent test are in the [calibrated export guide](../tools/bcpack_calibration/README.md).
 
+BC6H and BC7 chunks that reference the format's built-in history need a history table (section 4). The assets
+stage passes one to the decoder in two ways. A folder `<work>/bcpack_history` (files named as
+`tools/bcpack_history_calib.py` writes them, for example from `--ref-dds` references) is used in every build, in
+strict mode unless `--bcpack-provisional` is given. With `make_game.py --bcpack-provisional` and no such folder, the
+stage first runs `tools/bcpack_history_calib.py` over all the user's pools (BC6H and BC7, read-only) into
+`<work>/bcpack_history_auto`, again only when that tool, the decoder or the set of pools changes, and decodes with
+provisional entries allowed. Rows decoded that way record a decoder ending in `-provisional`; a later strict build
+keeps them rather than decoding them again. The pass stamp covers the history files and the mode, so a new table
+completes the pools again. A history table that does not load stops the stage with one error naming it.
+`tests/test_ttpf_assets.py` covers all of this on a synthetic BC7 pool whose chunk takes its endpoints from
+history entry 19. The calibration time on the full 57-pool corpus is not measured yet.
+
 `tools/ttpf_mips.py` is the read-only measurement and decode tool (with `tools/bcpack.py`
 enabled in strict confirmed-history mode by default), and `tools/bcpack_history_calib.py`
 derives local `--history <path>` JSON tables using only the Python standard library:

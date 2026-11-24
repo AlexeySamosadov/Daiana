@@ -282,7 +282,7 @@ class StageValidationAndSequencingTest(unittest.TestCase):
             emulate=unittest.mock.ANY, keep_emulated=True, fallbacks=unittest.mock.ANY)
         manager.assets.assert_called_once_with(
             os.path.abspath(self.game_dir), os.path.abspath(self.work_dir), False, unittest.mock.ANY,
-            dump_jobs=unittest.mock.ANY)
+            dump_jobs=unittest.mock.ANY, bcpack_provisional=False)
         self.assertIsNotNone(manager.assets.call_args.kwargs["dump_jobs"])
         manager.runtime.assert_called_once_with(
             os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None,
@@ -392,7 +392,24 @@ class JobsHandlingTest(unittest.TestCase):
                                     ret = make_game.main()
                                     self.assertEqual(ret, 0)
                                     mock_assets.assert_called_once_with(
-                                        os.path.abspath(game), os.path.abspath(work), True, 10, dump_jobs=None)
+                                        os.path.abspath(game), os.path.abspath(work), True, 10, dump_jobs=None,
+                                        bcpack_provisional=False)
+
+    def test_bcpack_provisional_forwarded_to_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = os.path.join(tmp, "game")
+            out = os.path.join(tmp, "out")
+            work = os.path.join(tmp, "work")
+            os.makedirs(game)
+            with patch.object(sys, "argv", ["make_game.py", "--game", game, "--out", out, "--work", work,
+                                            "--no-tui", "--stages", "assets", "--bcpack-provisional"]):
+                with patch("make_game.below_normal"):
+                    with patch("make_game.check", return_value={"expected_exe": "g.exe"}):
+                        with patch("make_game.preflight"):
+                            with patch("make_game.log"):
+                                with patch("make_game.assets") as mock_assets:
+                                    self.assertEqual(make_game.main(), 0)
+        self.assertIs(mock_assets.call_args.kwargs["bcpack_provisional"], True)
 
     def test_translate_spawns_exact_job_count(self):
         with tempfile.TemporaryDirectory() as tmp:

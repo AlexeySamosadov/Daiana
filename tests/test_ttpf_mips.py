@@ -1425,6 +1425,64 @@ class PoolCacheTest(unittest.TestCase):
             self.assertEqual(pools[0].read_range(4096, 4096, cache), payloads[0])
 
 
+def build_bc7_history_pool(path, hist_k=19):
+    """A 64x64 BC7 (DXGI 98) RDS5 pool whose one BCPack chunk takes its first endpoints from built-in history
+    entry `hist_k`: strict decoding refuses it without a history table. Returns (linear blocks, endpoint row)."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import test_bcpack as tb
+    path = os.fspath(path)
+    layout = ttpf.surface_layout(64, 64, 98, 1, ttpf.tile_bytes(4))
+    mip = layout["mips"][0]
+    nblocks = mip["blocks_w"] * mip["blocks_h"]
+    linear = bytearray()
+    for i in range(nblocks):
+        r0 = (i * 5 + 11) & 0x7F
+        g0 = (i * 3 + 23) & 0x7F
+        b0 = (i * 7 + 41) & 0x7F
+        acc = (1 << 6) | (r0 << 7) | (r0 << 14) | (g0 << 21) | (g0 << 28) | (b0 << 35) | (b0 << 42)
+        acc |= (0x7F << 49) | (0x7F << 56) | (1 << 63) | (1 << 64)
+        linear += acc.to_bytes(16, "little")
+    payload = bytearray(layout["size"])
+    retile_to(layout, mip, bytes(linear), payload)
+    mode6_pad = (1 << 6).to_bytes(16, "little")
+    for off in range(0, len(payload), 16):
+        if payload[off:off + 16] == b"\x00" * 16:
+            payload[off:off + 16] = mode6_pad
+
+    ep_row = [0x45, 0x22 << 1, 0x33 << 1, 0x7F << 1, 0x45, 0x22 << 1, 0x33 << 1, 0x7F << 1] * 3
+    packed_payload = tb.encode_bc7_mode6_blocks(bytes(payload), first_ep_history=(hist_k, ep_row))
+
+    pad = (-len(packed_payload)) % 256
+    count = 3
+    etpf = ttpf.align(24 + (count - 1) * 8, 256)
+    padded = ttpf.align(16 + 24 + 32, 4096)
+    source = etpf + padded
+    chunk_end = source + len(packed_payload) + pad
+    virt = padded
+    vsize = virt + layout["size"]
+    entry = (source // 256) | (7 << 26) | ((virt // 4096) << 30) | (pad << 52)
+    sentinel = (chunk_end // 256) | ((vsize // 4096) << 30)
+    header = bytearray(24)
+    header[0:4] = b"RDS5"
+    struct.pack_into("<I", header, 4, count)
+    struct.pack_into("<Q", header, 8, vsize | (22 << 56))
+    struct.pack_into("<I", header, 16, (count + 31) // 32)
+    a = (64 - 1) | ((64 - 1) << 14) | (0 << 28)
+    b = 1 | (98 << 3) | (1 << 21) | (4 << 23)
+    c = (virt // 4096) | (0x103 << 21)
+    record = struct.pack("<IIII", a, b, c, 0) + struct.pack("<Q", 0xCAFEBABE11223344)
+    blob = bytearray(chunk_end)
+    blob[0:24] = header
+    struct.pack_into("<QQ", blob, 24, entry, sentinel)
+    blob[etpf:etpf + 4] = b"ETPF"
+    struct.pack_into("<III", blob, etpf + 4, 634, 1, 24)
+    blob[etpf + 16:etpf + 16 + 24] = record
+    blob[source:source + len(packed_payload)] = packed_payload
+    with open(path, "wb") as f:
+        f.write(blob)
+    return bytes(linear), ep_row
+
+
 class SyntheticBcpackPoolTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1592,60 +1650,10 @@ class SyntheticBcpackPoolTest(unittest.TestCase):
     def test_bc7_bcpack_external_history_cli(self):
         import io
         from contextlib import redirect_stderr, redirect_stdout
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import test_bcpack as tb
-
-        layout = ttpf.surface_layout(64, 64, 98, 1, ttpf.tile_bytes(4))
-        mip = layout["mips"][0]
-        nblocks = mip["blocks_w"] * mip["blocks_h"]
-        linear = bytearray()
-        for i in range(nblocks):
-            r0 = (i * 5 + 11) & 0x7F
-            g0 = (i * 3 + 23) & 0x7F
-            b0 = (i * 7 + 41) & 0x7F
-            acc = (1 << 6) | (r0 << 7) | (r0 << 14) | (g0 << 21) | (g0 << 28) | (b0 << 35) | (b0 << 42)
-            acc |= (0x7F << 49) | (0x7F << 56) | (1 << 63) | (1 << 64)
-            linear += acc.to_bytes(16, "little")
-        payload = bytearray(layout["size"])
-        retile_to(layout, mip, bytes(linear), payload)
-        mode6_pad = (1 << 6).to_bytes(16, "little")
-        for off in range(0, len(payload), 16):
-            if payload[off:off + 16] == b"\x00" * 16:
-                payload[off:off + 16] = mode6_pad
-
-        hist_k = 19
-        ep_row = [0x45, 0x22 << 1, 0x33 << 1, 0x7F << 1, 0x45, 0x22 << 1, 0x33 << 1, 0x7F << 1] * 3
-        packed_payload = tb.encode_bc7_mode6_blocks(bytes(payload), first_ep_history=(hist_k, ep_row))
 
         path = os.path.join(self.tmp.name, "bc7_hist.ttpf")
-        pad = (-len(packed_payload)) % 256
-        count = 3
-        etpf = ttpf.align(24 + (count - 1) * 8, 256)
-        padded = ttpf.align(16 + 24 + 32, 4096)
-        source = etpf + padded
-        chunk_end = source + len(packed_payload) + pad
-        virt = padded
-        vsize = virt + layout["size"]
-        entry = (source // 256) | (7 << 26) | ((virt // 4096) << 30) | (pad << 52)
-        sentinel = (chunk_end // 256) | ((vsize // 4096) << 30)
-        header = bytearray(24)
-        header[0:4] = b"RDS5"
-        struct.pack_into("<I", header, 4, count)
-        struct.pack_into("<Q", header, 8, vsize | (22 << 56))
-        struct.pack_into("<I", header, 16, (count + 31) // 32)
-        a = (64 - 1) | ((64 - 1) << 14) | (0 << 28)
-        b = 1 | (98 << 3) | (1 << 21) | (4 << 23)
-        c = (virt // 4096) | (0x103 << 21)
-        record = struct.pack("<IIII", a, b, c, 0) + struct.pack("<Q", 0xCAFEBABE11223344)
-        blob = bytearray(chunk_end)
-        blob[0:24] = header
-        struct.pack_into("<QQ", blob, 24, entry, sentinel)
-        blob[etpf:etpf + 4] = b"ETPF"
-        struct.pack_into("<III", blob, etpf + 4, 634, 1, 24)
-        blob[etpf + 16:etpf + 16 + 24] = record
-        blob[source:source + len(packed_payload)] = packed_payload
-        with open(path, "wb") as f:
-            f.write(blob)
+        hist_k = 19
+        linear, ep_row = build_bc7_history_pool(path, hist_k)
 
         hist_json = os.path.join(self.tmp.name, "bc7_history.json")
         with open(hist_json, "w", encoding="utf-8") as f:

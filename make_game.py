@@ -23,7 +23,9 @@ Stages (each skips work that is already done, so a stopped build continues where
     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V; then the same for the
               compute programs inside amd_fidelityfx_upscaler_xbox.dll and XboxBvhBuilder.dll
     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
-              BCPack uses strict decoding by default. For local calibration use <work>/bcpack-calibration.json.
+              BCPack uses strict decoding by default. For local calibration use <work>/bcpack-calibration.json;
+              history tables in <work>/bcpack_history are used when present. --bcpack-provisional also
+              calibrates BC6H/BC7 history from your pools and decodes provisional entries (docs/textures.md)
     runtime   build the loader (needs the game's executable to run, not to build). On Linux it is cross-built with
               clang-cl and an xwin SDK (docs/testing.md) and gta6rt.sh starts it with Wine; --runtime-build DIR
               takes a Windows build of runtime/ instead (the runtime-windows artifact of the Runtime workflow)
@@ -2126,7 +2128,8 @@ def ttpf_manifest(pool_dir: str) -> dict | None:
     return doc
 
 
-def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = None) -> None:
+def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = None,
+           bcpack_provisional: bool = False) -> None:
     # make_game.py also runs under python -I, which omits the script directory.
     if TOOLS not in sys.path:
         sys.path.insert(0, TOOLS)
@@ -2170,8 +2173,8 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
         pools += [os.path.join(root, f) for f in files if f.lower().endswith(".ttpf")]
     if pools:
         try:
-            settings = ttpf_assets.load_profile(work)
-        except ValueError as exc:   # a hand-edited calibration profile is one build error, not a traceback
+            settings = ttpf_assets.load_settings(work, provisional=bcpack_provisional, pools=pools, log=log)
+        except ValueError as exc:   # a hand-edited profile or history table is one build error, not a traceback
             fail(str(exc))
     else:
         settings = None
@@ -2758,7 +2761,7 @@ def _invoke_stage(name: str, fn) -> None:
 
 def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, wav: bool, jobs: int,
                      runtime_build: str | None, emulate: bool, keep_emulated: bool,
-                     fallbacks: tuple[str, ...], overlap: bool = True) -> None:
+                     fallbacks: tuple[str, ...], overlap: bool = True, bcpack_provisional: bool = False) -> None:
     """Run build stages after check. With overlap=True (default), shaders/assets/runtime share the machine and
     pipelines starts once shaders (and a selected runtime rebuild) are ready. With overlap=False, stages run in order."""
     cpu_heavy = [s for s in ("shaders", "assets") if s in stages]
@@ -2771,7 +2774,7 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
         shaders(game, work, shader_jobs, emulate=emulate, keep_emulated=keep_emulated, fallbacks=fallbacks)
 
     def fn_assets():
-        assets(game, work, wav, jobs, dump_jobs=dump_jobs)
+        assets(game, work, wav, jobs, dump_jobs=dump_jobs, bcpack_provisional=bcpack_provisional)
 
     def fn_runtime():
         runtime(game, out, v, runtime_build, jobs, work=work)
@@ -2873,6 +2876,10 @@ def main() -> int:
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
     ap.add_argument("--wav", action="store_true",
                     help="also decode the Ogg Opus audio to 16-bit PCM WAV (much larger; needs ffmpeg)")
+    ap.add_argument("--bcpack-provisional", action="store_true",
+                    help="assets: calibrate BCPack BC6H/BC7 history tables from your texture pools (once, into "
+                         "<work>/bcpack_history_auto, unless <work>/bcpack_history exists) and decode textures that "
+                         "need provisional history entries; without it they stay skipped (docs/textures.md)")
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
     ap.add_argument("--runtime-build", metavar="DIR", type=nonempty_path,
@@ -3040,12 +3047,12 @@ def main() -> int:
             tui_board.set_summary(f"build 0% · {', '.join(build_stages)}")
             run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                              runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                             fallbacks=fallbacks, overlap=overlap)
+                             fallbacks=fallbacks, overlap=overlap, bcpack_provisional=a.bcpack_provisional)
             tui_board.set_summary(f"finished in {(time.time() - t0) / 60:.0f} min")
     else:
         run_build_stages(stages, game=game, work=work, out=out, v=v, wav=a.wav, jobs=a.jobs,
                          runtime_build=runtime_build, emulate=emulate, keep_emulated=keep_emulated,
-                         fallbacks=fallbacks, overlap=overlap)
+                         fallbacks=fallbacks, overlap=overlap, bcpack_provisional=a.bcpack_provisional)
     log(f"finished in {(time.time() - t0) / 60:.0f} min")
     return 0
 

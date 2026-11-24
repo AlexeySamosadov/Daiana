@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
+from typing import NamedTuple
 import zlib
 
 # `python -I` implies `-P`, so the script's directory is not on sys.path; the sibling modules are next to it.
@@ -60,6 +62,134 @@ def load_profile(work):
         raise RuntimeError("Calibrated texture export requires NumPy and the release build of "
                            "tools/bcpack_calibration (see its README.md)") from exc
     return "v1-" + hashlib.sha256(decoder_digest().encode() + raw).hexdigest(), profile
+
+
+# BCPack initial history tables (tools/bcpack_history_calib.py output). BC6H and BC7 chunks that reference the
+# format's built-in history only decode with them. A folder the user puts in <work> is used in every build (strict
+# unless --bcpack-provisional); the automatic one is calibrated from the user's own pools, and since every entry it
+# derives is provisional, it is made and used only with --bcpack-provisional.
+HISTORY_DIR = "bcpack_history"
+AUTO_HISTORY_DIR = "bcpack_history_auto"
+AUTO_HISTORY_RECORD = "calibration.key"
+AUTO_HISTORY_CODECS = "bc6h,bc7"
+CALIBRATION_SOURCES = ("bcpack_history_calib.py",)
+
+
+class Settings(NamedTuple):
+    """What complete_pool() decodes with. A plain (stamp, profile) pair is the strict pass without history."""
+    stamp: str                      # the pass stamp written to manifest["BCPackPass"]
+    profile: dict | None            # the calibrated reconstruction profile, if any
+    history: str | None = None      # BCPack history file or folder for tools/bcpack.py
+    provisional: bool = False       # decode unconfirmed history entries (labelled "-provisional")
+    fallback: str | None = None     # decoder record for rows decoded by ttpf_mips; None = the strict stamp
+
+
+def history_files(path):
+    """The JSON files a history path stands for, sorted: the file itself, or the *.json directly in a folder."""
+    path = Path(path)
+    if path.is_dir():
+        return sorted(p for p in path.iterdir() if p.suffix.lower() == ".json" and p.is_file())
+    return [path]
+
+
+def history_digest(path):
+    h = hashlib.sha256()
+    for p in history_files(path):
+        data = p.read_bytes()
+        h.update(f"{p.name}\0{len(data)}\0".encode())
+        h.update(data)
+    return h.hexdigest()
+
+
+def check_history(path):
+    """Read the BC6H and BC7 tables once, so a broken history file is one build error, not one per texture."""
+    import bcpack_tables_bptc as bptc
+    if not history_files(path):
+        raise ValueError(f"{path}: no BCPack history JSON files in this folder")
+    try:
+        bptc.load_bc6h(os.fspath(path), with_confirmed_bits=True)
+        bptc.load_bc7(os.fspath(path))
+        for codec in (1, 3, 4, 5):
+            bptc.load_bc_history(codec, os.fspath(path))
+    except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+        raise ValueError(f"{path}: not a usable BCPack history table: {exc}") from None
+
+
+def calibration_key(pools):
+    """Changes when the calibration tool, the decoder or the set of pools (name and size) changes."""
+    h = hashlib.sha256(decoder_digest().encode())
+    for name in CALIBRATION_SOURCES:
+        data = Path(__file__).with_name(name).read_bytes()
+        h.update(f"{name}\0{len(data)}\0".encode())
+        h.update(data)
+    for p in sorted(os.path.abspath(p) for p in pools):
+        h.update(f"{p}\0{os.path.getsize(p)}\n".encode())
+    return h.hexdigest()
+
+
+def run_calibration(pools, out):
+    """Calibrate BC6H/BC7 history tables from the pools into the folder `out` (tools/bcpack_history_calib.py)."""
+    import bcpack_history_calib as calib
+    try:
+        calib.run(["--out", os.fspath(out), "--codec", AUTO_HISTORY_CODECS, *map(os.fspath, pools)])
+    except calib.CliError as exc:
+        raise ValueError(f"BCPack history calibration failed: {exc}") from None
+
+
+def auto_history(work, pools, log=print):
+    """<work>/bcpack_history_auto, calibrated from `pools` once and again only when calibration_key() changes."""
+    folder = Path(work, AUTO_HISTORY_DIR)
+    key = calibration_key(pools)
+    record = folder / AUTO_HISTORY_RECORD
+    try:
+        if record.read_text(encoding="utf-8").strip() == key:
+            return folder
+    except OSError:
+        pass
+    log(f"assets: calibrating BCPack BC6H/BC7 history from {len(pools)} texture pool(s) into {folder} "
+        "(one time; it reads the pools and can take a while)")
+    # Calibrated into a staging folder and switched in whole, so a stopped run leaves no half-written table behind.
+    staging = Path(work, AUTO_HISTORY_DIR + ".partial")
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    try:
+        run_calibration(pools, staging)
+        (staging / AUTO_HISTORY_RECORD).write_text(key + "\n", encoding="utf-8")
+        shutil.rmtree(folder, ignore_errors=True)
+        os.replace(staging, folder)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return folder
+
+
+def load_settings(work, *, provisional=False, pools=(), log=print):
+    """The settings for complete_pool(): the calibration profile, plus BCPack history and the decode mode.
+
+    History comes from <work>/bcpack_history when the user put one there, otherwise, with `provisional`, from the
+    automatic calibration of `pools`. Without either, this is load_profile() unchanged. The pass stamp and the
+    decoder record of rows decoded through ttpf_mips cover the history files and the mode, so changing either
+    completes the pools again."""
+    stamp, profile = load_profile(work)
+    user = Path(work, HISTORY_DIR)
+    if user.exists():
+        history = user
+    elif provisional and pools:
+        history = auto_history(work, pools, log)
+    else:
+        history = None
+    if history is None and not provisional:
+        return Settings(stamp, profile)
+    if history is not None:
+        check_history(history)
+    mode = "provisional" if provisional else "strict"
+    h = hashlib.sha256(decoder_digest().encode())
+    h.update(b"\0" + (history_digest(history) if history is not None else "").encode() + b"\0" + mode.encode())
+    fallback = f"v1-{h.hexdigest()[:16]}-{mode}"
+    if profile is not None:
+        stamp = "v1-" + hashlib.sha256(f"{stamp}\0{fallback}".encode()).hexdigest()
+    else:
+        stamp = fallback
+    return Settings(stamp, profile, None if history is None else os.fspath(history), provisional, fallback)
 
 
 def publish(path, data):
@@ -136,23 +266,28 @@ def finish_replaced(directory, manifest):
               "next to the full-chain files; the next build tries again", file=sys.stderr)
 
 
-def candidate(row, profile):
+def candidate(row, profile, provisional=False):
     if row.get("DxgiFormat") not in ttpf.BC_FORMATS:
         return False
     if row.get("BCPackDecoder"):
-        return profile is not None or row["BCPackDecoder"].endswith("-strict")
+        # A strict result is redone by any later pass; a provisional one only by another provisional pass (a strict
+        # pass would refuse it again); a calibrated one only while there is a profile.
+        decoder = row["BCPackDecoder"]
+        return (profile is not None or decoder.endswith("-strict")
+                or (provisional and decoder.endswith("-provisional")))
     return (row["File"] is None or row.get("BaseMipLevel", 0) > 0
             or row.get("Mips", 0) < row.get("SourceMips", 0))
 
 
 def complete_pool(source, directory, manifest, settings):
     """Publish full chains next to ordinary DDS files, then switch the catalog to them."""
-    stamp, profile = settings
+    settings = Settings(*settings)
+    stamp, profile = settings.stamp, settings.profile
     directory = Path(directory)
     if manifest.get("BCPackPass") == stamp:
         finish_replaced(directory, manifest)
         return 0, 0
-    rows = [row for row in manifest["Textures"] if candidate(row, profile)]
+    rows = [row for row in manifest["Textures"] if candidate(row, profile, settings.provisional)]
     if not rows:
         return 0, 0
     written = blocked = 0
@@ -179,11 +314,15 @@ def complete_pool(source, directory, manifest, settings):
                         method = stamp
                         blob = decoder.dds(index)
                     else:
-                        if profile is not None and strict is None:
-                            strict = strict_stamp()   # once per pass: it reads and hashes six sources
-                        method = strict or stamp
+                        if settings.fallback is not None:
+                            method = settings.fallback
+                        else:
+                            if profile is not None and strict is None:
+                                strict = strict_stamp()   # once per pass: it reads and hashes six sources
+                            method = strict or stamp
                         analysis = ttpf.analyze(pool, index)
-                        blob = ttpf.texture_dds(pool, analysis)
+                        blob = ttpf.texture_dds(pool, analysis, allow_provisional=settings.provisional,
+                                                history=settings.history)
                 except (ValueError, KeyError, IndexError, ttpf.BcpackRequired,
                         bcpack.BcpackUnsupportedCodec, zlib.error) as exc:
                     row["BCPackLimitation"] = str(exc)
