@@ -17,7 +17,7 @@ import ttpf_assets
 import ttpf_mips
 import world_build
 from test_calibrated_texture import synthetic_profile
-from test_ttpf_mips import build_bc1_bcpack_pool
+from test_ttpf_mips import build_bc1_bcpack_pool, build_bc7_history_pool
 
 
 class TextureAssets(unittest.TestCase):
@@ -230,6 +230,31 @@ class TextureAssets(unittest.TestCase):
         self.assertNotEqual(updated, original)
         self.assertNotEqual(updated.read_bytes(), original.read_bytes())
 
+    def test_the_flag_reaches_the_pool_pass(self):
+        linear, ep_row = build_bc7_history_pool(self.pool)
+        self.legacy(DxgiFormat=98, SourceMips=1)
+        self.build()
+        self.assertIsNone(self.row_after_export()["File"])
+
+        def calibrate(pools, out):
+            self.assertEqual([Path(p) for p in pools], [self.pool])
+            bc7_history(out, ep_row, 0)
+        with mock.patch.object(ttpf_assets, "run_calibration", side_effect=calibrate):
+            make_game.assets(str(self.game), str(self.work), False, 1, bcpack_provisional=True)
+        row = self.row_after_export()
+        self.assertTrue(row["BCPackDecoder"].endswith("-provisional"))
+        self.assertEqual((self.folder / row["File"]).read_bytes()[148:], linear)
+
+    def test_a_broken_history_fails_the_build_with_one_line(self):
+        build_bc7_history_pool(self.pool)
+        self.legacy(DxgiFormat=98, SourceMips=1)
+        (self.work / ttpf_assets.HISTORY_DIR).mkdir()
+        (self.work / ttpf_assets.HISTORY_DIR / "bc7.json").write_text("{", encoding="utf-8")
+        with mock.patch.object(make_game, "fail", side_effect=SystemExit(1)) as fail:
+            with self.assertRaises(SystemExit):
+                self.build()
+        self.assertIn(ttpf_assets.HISTORY_DIR, fail.call_args.args[0])
+
     @unittest.skipUnless(os.environ.get("RPF9DUMP_DLL"), "requires the built rpf9dump")
     def test_new_base_and_pack_pools(self):
         dll = Path(os.environ["RPF9DUMP_DLL"]).resolve()
@@ -331,6 +356,11 @@ class CandidateRules(unittest.TestCase):
     def test_a_complete_chain_with_a_file_is_not_a_candidate(self):
         self.assertFalse(ttpf_assets.candidate(synthetic_row(File="000001.dds", Mips=5, SourceMips=5), None))
 
+    def test_a_provisional_claim_is_redone_only_by_a_provisional_pass(self):
+        row = synthetic_row(File="000001.dds", Mips=5, SourceMips=5, BCPackDecoder="v1-0123456789abcdef-provisional")
+        self.assertFalse(ttpf_assets.candidate(row, None))
+        self.assertTrue(ttpf_assets.candidate(row, None, True))
+
 
 class ProfileRules(unittest.TestCase):
     def setUp(self):
@@ -429,6 +459,155 @@ class CompletePoolEarlyReturn(unittest.TestCase):
                 manifest = {"Textures": [synthetic_row(Index=i) for i in range(32)]}
                 self.assertEqual(ttpf_assets.complete_pool("synthetic", out, manifest, ("v1-profile", {})), (0, 32))
                 self.assertEqual(stamps.call_count, passes)
+
+
+def bc7_history(folder, ep_row, confirmed_bits, entries=(19,)):
+    """Write a BC7 history table giving `entries` the endpoint row (tools/bcpack_history_calib.py's bc7.json)."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "bc7.json").write_text(json.dumps({
+        "historyEndpoints": {str(k): ep_row for k in entries},
+        "historyEndpointBits": {str(k): [8] * 24 for k in entries},
+        "historyEndpointConfirmedBits": {str(k): [confirmed_bits] * 24 for k in entries},
+    }), encoding="utf-8")
+
+
+class BcpackHistory(unittest.TestCase):
+    """A BC7 chunk that takes its endpoints from built-in history entry 19: refused without a table, decoded with
+    one, strictly when the table confirms the entry and only in a provisional pass when it does not."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.work = root / "work"
+        self.work.mkdir()
+        self.pool = root / "game/data/pool.ttpf"
+        self.pool.parent.mkdir(parents=True)
+        self.linear, self.ep_row = build_bc7_history_pool(self.pool)
+        self.folder = root / "assets/pool"
+        self.folder.mkdir(parents=True)
+        self.manifest = {"Count": 1, "Textures": [dict(
+            Index=0, AssetKey="CAFEBABE11223344", SourceMips=1, BaseMipLevel=0, Mips=0, File=None,
+            DxgiFormat=98, Limitation="BCPack")]}
+
+    def settings(self, **kw):
+        return ttpf_assets.load_settings(self.work, pools=[self.pool], log=lambda msg: None, **kw)
+
+    def complete(self, settings):
+        return ttpf_assets.complete_pool(self.pool, self.folder, self.manifest, settings)
+
+    @property
+    def row(self):
+        return self.manifest["Textures"][0]
+
+    def assert_exact(self):
+        self.assertEqual((self.folder / self.row["File"]).read_bytes()[148:], self.linear)
+
+    def test_without_history_the_texture_stays_limited(self):
+        settings = self.settings()
+        self.assertEqual(settings[:2], (ttpf_assets.strict_stamp(), None))
+        self.assertIsNone(settings.history)
+        self.assertEqual(self.complete(settings), (0, 1))
+        self.assertIsNone(self.row["File"])
+        self.assertIn("history", self.row["BCPackLimitation"])
+
+    def test_a_confirmed_user_history_decodes_strictly(self):
+        bc7_history(self.work / ttpf_assets.HISTORY_DIR, self.ep_row, 8)
+        settings = self.settings()
+        self.assertEqual(settings.history, str(self.work / ttpf_assets.HISTORY_DIR))
+        self.assertFalse(settings.provisional)
+        self.assertTrue(settings.stamp.endswith("-strict"))
+        self.assertNotEqual(settings.stamp, ttpf_assets.strict_stamp())
+        self.assertEqual(self.complete(settings), (1, 0))
+        self.assert_exact()
+        self.assertEqual(self.row["BCPackDecoder"], settings.fallback)
+        self.assertEqual(self.manifest["BCPackPass"], settings.stamp)
+
+    def test_an_unconfirmed_entry_needs_a_provisional_pass_which_a_strict_one_keeps(self):
+        bc7_history(self.work / ttpf_assets.HISTORY_DIR, self.ep_row, 0)
+        self.assertEqual(self.complete(self.settings()), (0, 1))
+        self.assertIsNone(self.row["File"])
+        provisional = self.settings(provisional=True)
+        self.assertTrue(provisional.stamp.endswith("-provisional"))
+        self.assertEqual(self.complete(provisional), (1, 0))
+        self.assert_exact()
+        self.assertTrue(self.row["BCPackDecoder"].endswith("-provisional"))
+        kept = self.row["File"]
+        # Back to a strict build: the provisional texture is not decoded again (strict would refuse it) and stays.
+        self.assertEqual(self.complete(self.settings()), (0, 0))
+        self.assertEqual(self.row["File"], kept)
+        self.assertTrue((self.folder / kept).is_file())
+
+    def test_another_history_completes_the_pool_again(self):
+        history = self.work / ttpf_assets.HISTORY_DIR
+        bc7_history(history, self.ep_row, 8)
+        first = self.settings()
+        self.assertEqual(self.complete(first), (1, 0))
+        old = self.row["File"]
+        bc7_history(history, self.ep_row, 8, entries=(19, 20))   # one more entry: another table
+        second = self.settings()
+        self.assertNotEqual(second.stamp, first.stamp)
+        self.assertEqual(self.complete(second), (1, 0))
+        self.assertNotEqual(self.row["File"], old)
+        self.assertFalse((self.folder / old).exists())
+        self.assert_exact()
+
+    def test_a_broken_history_is_one_error_that_names_it(self):
+        history = self.work / ttpf_assets.HISTORY_DIR
+        history.mkdir()
+        with self.assertRaisesRegex(ValueError, "no BCPack history JSON"):
+            self.settings()
+        (history / "bc7.json").write_text("{", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, ttpf_assets.HISTORY_DIR):
+            self.settings()
+
+    def fake_calibration(self, confirmed_bits=0):
+        def calibrate(pools, out):
+            bc7_history(out, self.ep_row, confirmed_bits)
+        return mock.patch.object(ttpf_assets, "run_calibration", side_effect=calibrate)
+
+    def test_a_provisional_build_calibrates_from_the_pools_once(self):
+        with self.fake_calibration() as calibrate:
+            settings = self.settings(provisional=True)
+            self.assertEqual(settings.history, str(self.work / ttpf_assets.AUTO_HISTORY_DIR))
+            self.assertEqual(self.complete(settings), (1, 0))
+            self.assert_exact()
+            self.assertEqual(self.settings(provisional=True), settings)
+            self.assertEqual(calibrate.call_count, 1)
+            # Another set of pools (here, one more) is calibrated again.
+            other = self.pool.with_name("other.ttpf")
+            other.write_bytes(self.pool.read_bytes())
+            ttpf_assets.load_settings(self.work, provisional=True, pools=[self.pool, other], log=lambda msg: None)
+            self.assertEqual(calibrate.call_count, 2)
+        self.assertFalse(self.work.joinpath(ttpf_assets.AUTO_HISTORY_DIR + ".partial").exists())
+
+    def test_a_strict_build_does_not_calibrate(self):
+        with self.fake_calibration() as calibrate:
+            self.assertEqual(self.settings()[:2], (ttpf_assets.strict_stamp(), None))
+        calibrate.assert_not_called()
+
+    def test_a_user_history_takes_the_place_of_the_calibration(self):
+        bc7_history(self.work / ttpf_assets.HISTORY_DIR, self.ep_row, 0)
+        with self.fake_calibration() as calibrate:
+            settings = self.settings(provisional=True)
+        calibrate.assert_not_called()
+        self.assertEqual(settings.history, str(self.work / ttpf_assets.HISTORY_DIR))
+
+    def test_a_failed_calibration_leaves_no_table_behind(self):
+        with mock.patch.object(ttpf_assets, "run_calibration", side_effect=ValueError("calibration failed")):
+            with self.assertRaisesRegex(ValueError, "calibration failed"):
+                self.settings(provisional=True)
+        self.assertEqual(sorted(p.name for p in self.work.iterdir()), [])
+
+    def test_the_calibration_tool_writes_a_table_the_decoder_reads(self):
+        # The real tools/bcpack_history_calib.py on the synthetic pool: whatever it can derive from one chunk, the
+        # build must accept its output folder as a history table.
+        with contextlib.redirect_stdout(io.StringIO()):
+            settings = self.settings(provisional=True)
+        folder = Path(settings.history)
+        self.assertTrue((folder / "bc7.json").is_file())
+        self.assertTrue((folder / ttpf_assets.AUTO_HISTORY_RECORD).is_file())
 
 
 if __name__ == "__main__":
